@@ -936,3 +936,93 @@ Describe "Packer E2E - Complex Composite Architecture" {
         Remove-Item $TestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+Describe "Stowage E2E - GitHub Dependency Orchestration" {
+    BeforeAll {
+        $TestRoot = New-Item -Path "$env:TEMP\StowageGitHubE2E" -ItemType Directory -Force
+        $Repo     = New-Item -Path "$TestRoot\Repo" -ItemType Directory -Force
+        $BuildDir = New-Item -Path "$TestRoot\Build" -ItemType Directory -Force
+        
+        # --- THE MOCK ZIP GENERATOR ---
+        # This function creates a dummy zip that mimics GitHub's nested folder structure
+        $CreateDummyZip = {
+            param($ZipPath, $RepoName, $RefName)
+            $Work = New-Item -Path "$env:TEMP\ZipWork_$((Get-Random))" -ItemType Directory -Force
+            $Inner = New-Item -Path "$Work\$RepoName-$RefName" -ItemType Directory -Force
+            "content" | Out-File "$Inner\dependency.ps1"
+            Compress-Archive -Path "$Inner" -DestinationPath $ZipPath -Force
+            Remove-Item $Work -Recurse -Force
+        }
+        
+        # Define a global mock function that mimics the cmdlet
+        function global:Invoke-WebRequest {
+            param($Uri, $OutFile)
+            # Create a dummy zip for the downloader to find
+            & $CreateDummyZip -ZipPath $OutFile -RepoName "Anvil" -RefName "main"
+        }
+        
+        function global:Invoke-RestMethod {
+            param($Uri, $Headers, $Method)
+
+            # Nothing done
+        }
+
+        # --- APP WITH GITHUB DEPENDENCIES ---
+        $AppRoot = New-Item -Path "$Repo\GitHubApp" -ItemType Directory -Force
+        '@{ 
+            Version = "1.0.0"; 
+            Dependencies = @(
+                # 1. Standard GitHub (No Name) -> Should result in folder ''Anvil''
+                @{ GitHub = "oren12321/Anvil"; Ref = "main" },
+                
+                # 2. Aliased GitHub (With Name) -> Should result in folder ''CustomName''
+                @{ GitHub = "oren12321/Stowage"; Ref = "v1.2"; Name = "CustomName" }
+            ) 
+        }' | Out-File "$AppRoot\Manifest.psd1"
+    }
+
+    Context "GitHub Remote Mapping" {
+
+        It "Should download, flatten, and alias GitHub repositories correctly" {
+            # Execute Stowage
+            & "$PSScriptRoot\Stowage.ps1" -ProjectPath $AppRoot -Destination $BuildDir
+
+            $SharedDir = "$BuildDir\GitHubApp\Shared"
+
+            # 1. Verify Standard GitHub (Name defaults to Repo name)
+            Test-Path "$SharedDir\Anvil\dependency.ps1" | Should -Be $true
+            # Ensure flattening worked (no double-nested folder)
+            (Get-ChildItem "$SharedDir\Anvil" -Directory).Count | Should -Be 0
+
+            # 2. Verify Aliased GitHub
+            Test-Path "$SharedDir\CustomName\dependency.ps1" | Should -Be $true
+        }
+
+        It "Should verify Paths.ps1 correctly points to GitHub-derived assets" {
+            . "$BuildDir\GitHubApp\Paths.ps1"
+            
+            # Check Standard Repo mapping
+            $Paths.Anvil | Should -Match "Shared\\Anvil$"
+            
+            # Check Aliased Repo mapping
+            $Paths.CustomName | Should -Match "Shared\\CustomName$"
+        }
+
+        It "Should clean up all temporary StowageCache folders in TEMP" {
+            $CacheRoot = Join-Path $env:TEMP "StowageCache"
+            if (Test-Path $CacheRoot) {
+                # Check if there are any leftover randomized subfolders
+                Get-ChildItem $CacheRoot | Should -BeNullOrEmpty
+            }
+        }
+    }
+
+    AfterAll {
+        Remove-Item $TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        
+        # CRITICAL: Clean up the global mock to avoid polluting your session
+        if (Get-Command global:Invoke-WebRequest -ErrorAction SilentlyContinue) {
+            Remove-Item Function:global:Invoke-WebRequest
+        }
+    }
+}

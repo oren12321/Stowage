@@ -9,6 +9,103 @@ $script:ProcessingStack = New-Object System.Collections.Generic.Stack[string]
 $script:DiscoveredModules = @{}
 $script:RootPath = $null 
 
+function Get-GitHubRepository {
+    param(
+        [string]$Owner,
+        [string]$Repo,
+        [string]$Ref,
+        [string]$Dest
+    )
+    
+    $url = "https://github.com/$Owner/$Repo/archive/$Ref.zip"
+    $tempZip = Join-Path $env:TEMP "$Repo-$Ref-$((Get-Random).ToString()).zip"
+
+    try {
+        # 1. Download with ErrorAction Stop to trigger the catch block on failure
+        Invoke-WebRequest -Uri $url -OutFile $tempZip -ErrorAction Stop
+
+        # 2. Extract to destination
+        Expand-Archive -Path $tempZip -DestinationPath $Dest -Force
+
+        # 3. Flatten the GitHub subfolder (The 'Stowage' clean-up)
+        $nestedFolder = Get-ChildItem -Path $Dest -Directory | Select-Object -First 1
+        if ($null -ne $nestedFolder) {
+            Get-ChildItem -Path $nestedFolder.FullName | Move-Item -Destination $Dest -Force
+            Remove-Item -Path $nestedFolder.FullName -Recurse -Force
+        }
+    }
+    catch {
+        # Cleanup the destination if it was partially created
+        if (Test-Path $Dest) { Remove-Item -Path $Dest -Recurse -Force }
+        
+        # Throw a descriptive exception for the Stowage engine
+        throw "Stowage Error: Failed to fetch GitHub repository [$Owner/$Repo] at ref [$Ref]. Technical details: $($_.Exception.Message)"
+    }
+    finally {
+        # Always remove the temporary zip file
+        if (Test-Path $tempZip) { Remove-Item $tempZip -Force }
+    }
+}
+
+function Test-GitHubRef {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string]$Owner,
+
+        [Parameter(Mandatory)]
+        [string]$Repo,
+
+        [Parameter(Mandatory)]
+        [string]$Ref
+    )
+
+    # GitHub requires a User-Agent header even without a token
+    $Headers = @{
+        "User-Agent" = "PowerShell"
+    }
+
+    # Try branch and tag refs
+    $possibleRefs = @(
+        "heads/$Ref",
+        "tags/$Ref"
+    )
+
+    foreach ($r in $possibleRefs) {
+        $url = "https://api.github.com/repos/$Owner/$Repo/git/ref/$r"
+        try {
+            Invoke-RestMethod -Uri $url -Headers $Headers -Method GET -ErrorAction Stop | Out-Null
+            return [pscustomobject]@{
+                Exists = $true
+                Type   = $r
+                Url    = $url
+            }
+        }
+        catch {}
+    }
+
+    # Try commit SHA if it looks like one
+    if ($Ref -match '^[0-9a-f]{7,40}$') {
+        $url = "https://api.github.com/repos/$Owner/$Repo/commits/$Ref"
+        try {
+            Invoke-RestMethod -Uri $url -Headers $Headers -Method GET -ErrorAction Stop | Out-Null
+            return [pscustomobject]@{
+                Exists = $true
+                Type   = "commit"
+                Url    = $url
+            }
+        }
+        catch {}
+    }
+
+    # Nothing matched
+    return [pscustomobject]@{
+        Exists = $false
+        Type   = $null
+        Url    = $null
+    }
+}
+
 function Invoke-RecursivePack {
     param([string]$Src, [string]$Dest, [switch]$AuditOnly, [switch]$IsRoot)
     
@@ -77,11 +174,42 @@ function Invoke-RecursivePack {
             $mapEntries = @()
             
             foreach ($depEntry in $manifestData.Dependencies) {
+                if ($depEntry -is [hashtable] -and $depEntry.ContainsKey('GitHub')) {
+                    $ghOwner, $ghRepo = $depEntry.GitHub -split '/'
+                    $ghRef = $depEntry.Ref
+                    
+                    # Point to TEMP so $Src stays clean
+                    $tempPath = [System.IO.Path]::Combine($env:TEMP, "StowageCache", "$ghRepo-$ghRef-$((Get-Random).ToString())")
+                    
+                    if (-not $AuditOnly -and -not (Test-Path $tempPath)) {
+                        Get-GitHubRepository -Owner $ghOwner -Repo $ghRepo -Ref $ghRef -Dest $tempPath
+                    }
+                    elseif ($AuditOnly) {
+                        $gitCheckResult = Test-GitHubRef -Owner $ghOwner -Repo $ghRepo -Ref $ghRef
+                        
+                        if (-not $gitCheckResult.Exists) {
+                            throw "DEPENDENCY NOT FOUND: '$folderName' requires '$ghOwner/$ghRepo -> $ghRef'"
+                        }
+                        
+                        $remoteDepFoundInAuditOnly = $true
+                    }
+                    
+                    # Convert to a standard Aliased Dependency
+                    $depEntry = @{
+                        Name = if ($depEntry.Name) { $depEntry.Name } else { $ghRepo }
+                        Path = $tempPath
+                    }
+                }
+                
                 $isAlias = $depEntry -is [hashtable]
                 $relPath = if ($isAlias) { $depEntry.Path } else { $depEntry }
-                $depSrcPath = [System.IO.Path]::GetFullPath((Join-Path $Src $relPath))
+                $depSrcPath = if ([System.IO.Path]::IsPathRooted($relPath)) {
+                    $relPath 
+                } else {
+                    [System.IO.Path]::GetFullPath((Join-Path $Src $relPath))
+                }
                 
-                if (-not (Test-Path $depSrcPath)) { throw "DEPENDENCY NOT FOUND: '$folderName' requires '$relPath'" }
+                if (-not (Test-Path $depSrcPath) -and -not $remoteDepFoundInAuditOnly) { throw "DEPENDENCY NOT FOUND: '$folderName' requires '$relPath'" }
 
                 $baseName = Split-Path $depSrcPath -Leaf
                 $depName = if ($isAlias -and $depEntry.Name) { $depEntry.Name } else { $baseName }
@@ -112,7 +240,7 @@ function Invoke-RecursivePack {
                 }
 
                 if ($isProject) {
-                    Invoke-RecursivePack -Src $depSrcPath -Dest $depDest -AuditOnly:$AuditOnly
+                    Invoke-RecursivePack -Src $depSrcPath -Dest $depDest -AuditOnly:$AuditOnly -IsRoot:$false
                 } elseif (-not $AuditOnly) {
                     if (-not (Test-Path $depDest)) { New-Item -ItemType Directory -Path $depDest -Force | Out-Null }
                     
@@ -121,6 +249,10 @@ function Invoke-RecursivePack {
                     } else {
                         Copy-Item -Path (Join-Path $depSrcPath "*") -Destination $depDest -Recurse -Force
                     }
+                }
+                
+                if ($tempPath -and (Test-Path $tempPath)) {
+                    Remove-Item -Path $tempPath -Recurse -Force  
                 }
             }
 

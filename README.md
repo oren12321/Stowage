@@ -32,6 +32,7 @@ Dependencies = @(
     "../External/Logger",               # Standard Project
     "../Assets/config.json",            # Static File Asset
     @{ Name="Net"; Path="../Network" }  # Aliased Dependency
+    @{ GitHub = "Owner/Anvil"; Ref = "v2.0.1"; Name = "AnvilCore" }, # GitHub repo
 )
 ```
 
